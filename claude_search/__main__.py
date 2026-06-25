@@ -332,12 +332,14 @@ def _make_preview_cmd(id_to_path: dict, tmpdir: str, field: int = 2) -> str:
             "      if count >= 10: break\n"
         )
 
-    fld_placeholder = f"{{{field}}}"
+    fld_placeholder = f"{{{field}}}"   # fzf substitution, e.g. {3}
     is_windows = platform.system() == "Windows"
     if is_windows:
         preview_bat = os.path.join(tmpdir, "preview.bat")
         with open(preview_bat, "w", encoding="utf-8") as f:
-            f.write(f'@echo off\n"{sys.executable}" "{preview_script}" %{field}\n')
+            # fzf passes the extracted field as the FIRST argument to the bat;
+            # use %1 regardless of which field number was selected.
+            f.write(f'@echo off\n"{sys.executable}" "{preview_script}" %1\n')
         return f"{preview_bat} {fld_placeholder}"
     else:
         os.chmod(preview_script, 0o755)
