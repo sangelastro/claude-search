@@ -29,11 +29,16 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+from claude_search._extract import content_to_text
+
 
 MAX_RESULTS = 30
 PREVIEW_MESSAGES = 10
 CACHE_PATH = Path.home() / ".cache" / "claude-search" / "index.json"
-CACHE_VERSION = 3
+# Bumped to 4: extracted text now filters out Claude Code's synthetic
+# messages (command boilerplate/output, notifications, bash output), so the
+# previously cached text is stale and must be rebuilt.
+CACHE_VERSION = 4
 
 
 def get_claude_dir() -> Path:
@@ -69,19 +74,12 @@ def _save_cache(cache: dict) -> None:
 
 # ── text extraction ────────────────────────────────────────────────────────────
 
-def _content_to_text(content) -> str:
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        return " ".join(
-            b.get("text", "") for b in content
-            if isinstance(b, dict) and b.get("type") == "text"
-        ).strip()
-    return ""
-
-
 def extract_session(filepath: Path):
     """Return (full_text, cwd, first_user_msg, name) from a JSONL session file.
+
+    Only user-authored text is kept (see ``_extract.content_to_text``):
+    Claude Code's synthetic messages — command boilerplate/output, task
+    notifications, system reminders and `!` bash output — are filtered out.
 
     name priority: customTitle (from /rename) > slug (auto-generated) > ""
     """
@@ -110,7 +108,7 @@ def extract_session(filepath: Path):
             if obj.get("type") != "user":
                 continue
 
-            text = _content_to_text(obj.get("message", {}).get("content", ""))
+            text = content_to_text(obj.get("message", {}).get("content", ""))
             if text:
                 texts.append(text)
                 if first_user_msg is None:
@@ -120,29 +118,6 @@ def extract_session(filepath: Path):
 
     name = custom_title or slug or ""
     return " ".join(texts), cwd, first_user_msg or "", name
-
-
-def build_preview(filepath: Path, n: int = PREVIEW_MESSAGES) -> str:
-    lines = []
-    count = 0
-    with open(filepath, encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if obj.get("type") != "user":
-                continue
-            text = _content_to_text(obj.get("message", {}).get("content", ""))
-            if text:
-                count += 1
-                lines.append(f"[{count}] {text[:400].replace(chr(10), ' ')}")
-                if count >= n:
-                    break
-    return "\n".join(lines) if lines else "(no messages)"
 
 
 # ── scoring ────────────────────────────────────────────────────────────────────
@@ -307,29 +282,20 @@ def _print_banner() -> None:
 
 def _make_preview_cmd(id_to_path: dict, tmpdir: str, field: int = 2) -> str:
     """Build fzf preview shell command. `field` is the 1-based fzf field with the session_id."""
+    # The preview runs in a separate Python subprocess spawned by fzf, so it
+    # reuses the same filtering as the indexer by importing claude_search._extract
+    # (the package dir is injected into sys.path to work for any install mode).
+    pkg_parent = str(Path(__file__).resolve().parent.parent)
     preview_script = os.path.join(tmpdir, "preview.py")
     with open(preview_script, "w", encoding="utf-8") as f:
-        f.write("import sys, json\n")
+        f.write("import sys\n")
+        f.write(f"sys.path.insert(0, {json.dumps(pkg_parent)})\n")
+        f.write("from claude_search._extract import preview_text\n")
         f.write(f"id_to_path = {json.dumps(id_to_path)}\n")
         f.write(
             "sid = sys.argv[1].strip() if len(sys.argv) > 1 else ''\n"
             "path = id_to_path.get(sid)\n"
-            "if not path: print('(not found)'); sys.exit(0)\n"
-            "count = 0\n"
-            "with open(path, encoding='utf-8', errors='ignore') as fh:\n"
-            "  for row in fh:\n"
-            "    row = row.strip()\n"
-            "    if not row: continue\n"
-            "    try: obj = json.loads(row)\n"
-            "    except: continue\n"
-            "    if obj.get('type') != 'user': continue\n"
-            "    c = obj.get('message', {}).get('content', '')\n"
-            "    t = c if isinstance(c, str) else ' '.join(b.get('text','') for b in c if isinstance(b,dict) and b.get('type')=='text')\n"
-            "    t = t.strip()\n"
-            "    if t:\n"
-            "      count += 1\n"
-            "      print(f'[{count}] ' + t[:400].replace('\\n',' '))\n"
-            "      if count >= 10: break\n"
+            f"print(preview_text(path, {PREVIEW_MESSAGES}) if path else '(not found)')\n"
         )
 
     fld_placeholder = f"{{{field}}}"   # fzf substitution, e.g. {3}
