@@ -212,49 +212,92 @@ def score_sessions(query: str, corpus: list[str]) -> tuple[list[float], str]:
 
 # ── banner (animated) ──────────────────────────────────────────────────────────
 
+# Compact Claude logo (~20 lines), same = / + style as the original.
+_LOGO_LINES = [
+    "          ======                              ",
+    "        ==========                            ",
+    "       ============          ====             ",
+    "       ============        =======            ",
+    "       ============       ========            ",
+    "        ===========      ========             ",
+    "          =========     ========+             ",
+    "           =======    +========               ",
+    "            ==================                ",
+    "             ================                 ",
+    "            ==================                ",
+    "           =======    +========               ",
+    "          =========     ========+             ",
+    "        ===========      ========             ",
+    "       ============       ========            ",
+    "       ============        =======            ",
+    "       ============          ====             ",
+    "        ==========                            ",
+    "          ======                              ",
+]
+
+# Gradient palette: dark amber → bright orange → pale gold
+_PALETTE = [
+    "\033[38;5;94m",   # dark amber-brown
+    "\033[38;5;130m",  # dark orange
+    "\033[38;5;166m",  # medium orange
+    "\033[38;5;208m",  # Claude orange
+    "\033[38;5;214m",  # amber-gold
+    "\033[38;5;220m",  # gold
+    "\033[38;5;222m",  # pale gold
+]
+
+
 def _print_banner() -> None:
-    """Animated Claude logo with spinning lens — mirrors the Claude chat animation."""
+    """Animated Claude logo: diagonal colour wave, same style as Claude chat."""
     if not sys.stderr.isatty():
         return
 
-    O  = "\033[38;5;208m"   # orange (Claude brand)
-    LO = "\033[38;5;222m"   # light amber
-    W  = "\033[1;97m"        # bold white
-    D  = "\033[2;37m"        # dim grey
-    R  = "\033[0m"           # reset
-    HIDE = "\033[?25l"       # hide cursor
-    SHOW = "\033[?25h"       # show cursor
+    R    = "\033[0m"
+    W    = "\033[1;97m"
+    D    = "\033[2;37m"
+    HIDE = "\033[?25l"
+    SHOW = "\033[?25h"
 
-    # Rotating half-circle characters simulate the Claude logo spin
-    spin = ["◐", "◑", "◒", "◓"]
+    P    = _PALETTE
+    NP   = len(P)
+    NLINES = len(_LOGO_LINES) + 2   # logo + 2 text lines
+    UP   = f"\033[{NLINES}A"
 
-    def _frame(ch: str) -> str:
-        return (
-            "\n"
-            f"{O}      .─────.{R}\n"
-            f"{O}     (  {LO}{ch}{O}  )   {W}CLAUDE  SEARCH{R}\n"
-            f"{O}      '─────'   {D}AI Session Explorer{R}\n"
-            f"{O}          \\{R}\n"
-            f"{O}           \\──{R}\n"
-        )
-
-    NLINES = 6            # newline count inside _frame()
-    UP = f"\033[{NLINES}A"  # cursor-up to redraw from same position
+    def _render(t: float) -> str:
+        rows = []
+        for y, line in enumerate(_LOGO_LINES):
+            row = []
+            for x, ch in enumerate(line):
+                if ch in ("=", "+"):
+                    # diagonal wave: top-right → bottom-left
+                    wave = math.sin((x * 0.15 - y * 0.25 + t) * math.pi)
+                    idx = min(NP - 1, max(0, int((wave + 1) / 2 * (NP - 1))))
+                    row.append(P[idx] + ch + R)
+                else:
+                    row.append(ch)
+            rows.append("".join(row))
+        rows.append(f"  {W}CLAUDE  SEARCH{R}")
+        rows.append(f"  {D}AI Session Explorer{R}")
+        return "\n".join(rows) + "\n"
 
     try:
         sys.stderr.write(HIDE)
-        sys.stderr.write(_frame(spin[0]))
+        sys.stderr.write(_render(0.0))
         sys.stderr.flush()
 
-        for i in range(1, 13):   # 12 frames × 80 ms ≈ 1 second
-            time.sleep(0.08)
+        for i in range(1, 20):          # 20 frames × 70 ms ≈ 1.4 s
+            time.sleep(0.07)
             sys.stderr.write(UP)
-            sys.stderr.write(_frame(spin[i % 4]))
+            sys.stderr.write(_render(i * 0.18))
             sys.stderr.flush()
 
-        sys.stderr.write("\n")
+        # Erase logo, keep only the text header for context
+        sys.stderr.write(UP)
+        sys.stderr.write("\033[0J")     # erase to end of screen
+        sys.stderr.flush()
+
     except Exception:
-        sys.stderr.write(_frame("◉") + "\n")
+        pass
     finally:
         sys.stderr.write(SHOW)
         sys.stderr.flush()
