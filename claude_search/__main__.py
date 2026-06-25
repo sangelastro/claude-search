@@ -32,7 +32,7 @@ from pathlib import Path
 MAX_RESULTS = 30
 PREVIEW_MESSAGES = 10
 CACHE_PATH = Path.home() / ".cache" / "claude-search" / "index.json"
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 def get_claude_dir() -> Path:
@@ -80,10 +80,14 @@ def _content_to_text(content) -> str:
 
 
 def extract_session(filepath: Path):
-    """Return (full_text, cwd, first_user_msg, slug) from a JSONL session file."""
+    """Return (full_text, cwd, first_user_msg, name) from a JSONL session file.
+
+    name priority: customTitle (from /rename) > slug (auto-generated) > ""
+    """
     texts = []
     cwd = None
     first_user_msg = None
+    custom_title = None
     slug = None
 
     with open(filepath, encoding="utf-8", errors="ignore") as f:
@@ -95,6 +99,9 @@ def extract_session(filepath: Path):
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+
+            if obj.get("type") == "custom-title" and obj.get("customTitle"):
+                custom_title = obj["customTitle"]
 
             if not slug and obj.get("slug"):
                 slug = obj["slug"]
@@ -110,7 +117,8 @@ def extract_session(filepath: Path):
             if not cwd and obj.get("cwd"):
                 cwd = obj["cwd"]
 
-    return " ".join(texts), cwd, first_user_msg or "", slug or ""
+    name = custom_title or slug or ""
+    return " ".join(texts), cwd, first_user_msg or "", name
 
 
 def build_preview(filepath: Path, n: int = PREVIEW_MESSAGES) -> str:
@@ -201,9 +209,30 @@ def score_sessions(query: str, corpus: list[str]) -> tuple[list[float], str]:
     return _score_tfidf(query, corpus), "TF-IDF"
 
 
-# ── fzf preview script builder ─────────────────────────────────────────────────
+# ── banner ─────────────────────────────────────────────────────────────────────
 
-def _make_preview_cmd(id_to_path: dict, tmpdir: str) -> str:
+def _print_banner() -> None:
+    if not sys.stderr.isatty():
+        return
+    O  = "\033[38;5;208m"   # orange (Claude brand)
+    LO = "\033[38;5;222m"   # light amber
+    W  = "\033[1;97m"        # bold white
+    D  = "\033[2;37m"        # dim grey
+    R  = "\033[0m"           # reset
+
+    print(f"""\
+{O}      .─────.{R}
+{O}     (  {LO} ◉ {O}  )   {W}CLAUDE  SEARCH{R}
+{O}      '─────'   {D}AI Session Explorer{R}
+{O}          \\{R}
+{O}           \\──{R}
+""", file=sys.stderr)
+
+
+# ── fzf helpers ────────────────────────────────────────────────────────────────
+
+def _make_preview_cmd(id_to_path: dict, tmpdir: str, field: int = 2) -> str:
+    """Build fzf preview shell command. `field` is the 1-based fzf field with the session_id."""
     preview_script = os.path.join(tmpdir, "preview.py")
     with open(preview_script, "w", encoding="utf-8") as f:
         f.write("import sys, json\n")
@@ -229,18 +258,19 @@ def _make_preview_cmd(id_to_path: dict, tmpdir: str) -> str:
             "      if count >= 10: break\n"
         )
 
+    fld_placeholder = f"{{{field}}}"
     is_windows = platform.system() == "Windows"
     if is_windows:
         preview_bat = os.path.join(tmpdir, "preview.bat")
         with open(preview_bat, "w", encoding="utf-8") as f:
-            f.write(f'@echo off\n"{sys.executable}" "{preview_script}" %1\n')
-        return f"{preview_bat} {{2}}"
+            f.write(f'@echo off\n"{sys.executable}" "{preview_script}" %{field}\n')
+        return f"{preview_bat} {fld_placeholder}"
     else:
         os.chmod(preview_script, 0o755)
-        return f"{sys.executable} {preview_script} {{2}}"
+        return f"{sys.executable} {preview_script} {fld_placeholder}"
 
 
-def _run_fzf(fzf_lines: list[str], header: str, preview_cmd: str) -> str | None:
+def _run_fzf(fzf_lines: list[str], header: str, preview_cmd: str, with_nth: str) -> str | None:
     """Run fzf and return the selected line, or None if cancelled."""
     tmpdir = tempfile.mkdtemp(prefix="claude-search-")
     input_file = os.path.join(tmpdir, "input.txt")
@@ -251,8 +281,9 @@ def _run_fzf(fzf_lines: list[str], header: str, preview_cmd: str) -> str | None:
         subprocess.run(
             f'fzf'
             f' --delimiter="|"'
+            f' --with-nth={with_nth}'
             f' --preview="{preview_cmd}"'
-            f' --preview-window=right:50%:wrap'
+            f' --preview-window=down:40%:wrap'
             f' --height=90%'
             f' --layout=reverse'
             f' --border'
@@ -267,44 +298,49 @@ def _run_fzf(fzf_lines: list[str], header: str, preview_cmd: str) -> str | None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ── selection UI ───────────────────────────────────────────────────────────────
+# ── selection UI (search mode) ─────────────────────────────────────────────────
 
-# Session tuple inside ranked: (score, session_id, text, cwd, first_msg, slug, jsonl_path)
-# Fields in fzf search line:    score | session_id | slug | cwd | label
-#   → field {2} = session_id (used by preview), parts[1]=session_id, parts[3]=cwd
+# Search fzf line:  pct% | name | session_id | cwd | first_msg
+#   displayed (--with-nth=1,2,4,5): score%, name, cwd, first_msg
+#   field 3 = session_id (hidden, used by preview via {3})
+#   parse: parts[2]=session_id, parts[3]=cwd
 
 def _fzf_select(ranked, query: str, id_to_path: dict) -> tuple[str, str] | None:
     """Search results with fzf. Returns (session_id, cwd) or None."""
+    max_score = ranked[0][0] if ranked else 1.0
     tmpdir = tempfile.mkdtemp(prefix="claude-search-")
     try:
-        preview_cmd = _make_preview_cmd(id_to_path, tmpdir)
+        preview_cmd = _make_preview_cmd(id_to_path, tmpdir, field=3)
         fzf_lines = []
-        for score, session_id, _, cwd, first_msg, slug, _ in ranked:
+        for score, session_id, _, cwd, first_msg, name, _ in ranked:
+            pct = int(score / max_score * 100) if max_score > 0 else 0
             label = first_msg[:80].replace("\n", " ")
             short_cwd = cwd.replace(str(Path.home()), "~")
-            slug_col = slug if slug else "-"
-            fzf_lines.append(f"{score:.3f} | {session_id} | {slug_col} | {short_cwd} | {label}")
+            name_col = name if name else "(no name)"
+            fzf_lines.append(f"{pct:3d}% | {name_col} | {session_id} | {short_cwd} | {label}")
 
         header = f"Search: {query} — {len(ranked)} results"
-        selected = _run_fzf(fzf_lines, header, preview_cmd)
+        selected = _run_fzf(fzf_lines, header, preview_cmd, with_nth="1,2,4,5")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     if not selected:
         return None
     parts = [p.strip() for p in selected.split("|")]
-    # parts[1]=session_id, parts[3]=cwd
-    return parts[1], parts[3].replace("~", str(Path.home()))
+    # parts[2]=session_id, parts[3]=cwd
+    return parts[2], parts[3].replace("~", str(Path.home()))
 
 
 def _list_select(ranked) -> tuple[str, str] | None:
-    """Numbered list fallback for search. Returns (session_id, cwd) or None."""
+    """Numbered list fallback for search (no fzf). Returns (session_id, cwd) or None."""
+    max_score = ranked[0][0] if ranked else 1.0
     print(file=sys.stderr)
-    for i, (score, session_id, _, cwd, first_msg, slug, _) in enumerate(ranked, 1):
+    for i, (score, session_id, _, cwd, first_msg, name, _) in enumerate(ranked, 1):
+        pct = int(score / max_score * 100) if max_score > 0 else 0
         short_cwd = cwd.replace(str(Path.home()), "~")
         label = first_msg[:90].replace("\n", " ")
-        slug_str = f" [{slug}]" if slug else ""
-        print(f"  {i:2}. [{score:.3f}]{slug_str} {label}", file=sys.stderr)
+        name_str = f" [{name}]" if name else ""
+        print(f"  {i:2}. {pct:3d}%{name_str} {label}", file=sys.stderr)
         print(f"       {short_cwd}  ({session_id[:8]}...)\n", file=sys.stderr)
 
     choice = input("Select number (Enter to cancel): ").strip()
@@ -319,30 +355,32 @@ def _list_select(ranked) -> tuple[str, str] | None:
         return None
 
 
-# ── alphabetical list UI ───────────────────────────────────────────────────────
+# ── selection UI (alphabetical list mode) ─────────────────────────────────────
 
-# fzf list line: slug_or_name | session_id | cwd | label
-#   → field {2} = session_id (preview), parts[1]=session_id, parts[2]=cwd
+# List fzf line:  name | session_id | cwd | first_msg
+#   displayed (--with-nth=1,3,4): name, cwd, first_msg
+#   field 2 = session_id (hidden, used by preview via {2})
+#   parse: parts[1]=session_id, parts[2]=cwd
 
 def _fzf_list_all(sessions, id_to_path: dict) -> tuple[str, str] | None:
     """Alphabetical list of all sessions with fzf. Returns (session_id, cwd) or None."""
     tmpdir = tempfile.mkdtemp(prefix="claude-search-")
     try:
-        preview_cmd = _make_preview_cmd(id_to_path, tmpdir)
-        # sessions tuple: (session_id, text, cwd, first_msg, slug, jsonl_path)
+        preview_cmd = _make_preview_cmd(id_to_path, tmpdir, field=2)
+        # sessions tuple: (session_id, text, cwd, first_msg, name, jsonl_path)
         sorted_sessions = sorted(
             sessions,
             key=lambda s: (s[4].lower() if s[4] else "\xff", s[3][:60].lower()),
         )
         fzf_lines = []
-        for session_id, _, cwd, first_msg, slug, _ in sorted_sessions:
+        for session_id, _, cwd, first_msg, name, _ in sorted_sessions:
             label = first_msg[:80].replace("\n", " ")
             short_cwd = cwd.replace(str(Path.home()), "~")
-            name_col = slug if slug else f"({first_msg[:40].replace(chr(10), ' ')})"
+            name_col = name if name else f"({first_msg[:40].replace(chr(10), ' ')})"
             fzf_lines.append(f"{name_col} | {session_id} | {short_cwd} | {label}")
 
         header = f"All sessions — {len(sessions)} total (alphabetical)"
-        selected = _run_fzf(fzf_lines, header, preview_cmd)
+        selected = _run_fzf(fzf_lines, header, preview_cmd, with_nth="1,3,4")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -354,17 +392,17 @@ def _fzf_list_all(sessions, id_to_path: dict) -> tuple[str, str] | None:
 
 
 def _list_all_select(sessions) -> tuple[str, str] | None:
-    """Numbered alphabetical list fallback. Returns (session_id, cwd) or None."""
+    """Numbered alphabetical list fallback (no fzf). Returns (session_id, cwd) or None."""
+    # sessions tuple: (session_id, text, cwd, first_msg, name, jsonl_path)
     sorted_sessions = sorted(
         sessions,
         key=lambda s: (s[4].lower() if s[4] else "\xff", s[3][:60].lower()),
     )
     print(file=sys.stderr)
-    for i, (session_id, _, cwd, first_msg, slug, _) in enumerate(sorted_sessions, 1):
+    for i, (session_id, _, cwd, first_msg, name, _) in enumerate(sorted_sessions, 1):
         short_cwd = cwd.replace(str(Path.home()), "~")
-        label = first_msg[:70].replace("\n", " ")
-        name = slug if slug else f"({label[:40]})"
-        print(f"  {i:3}. {name}", file=sys.stderr)
+        display_name = name if name else f"({first_msg[:40].replace(chr(10), ' ')})"
+        print(f"  {i:3}. {display_name}", file=sys.stderr)
         print(f"        {short_cwd}  ({session_id[:8]}...)\n", file=sys.stderr)
 
     choice = input("Select number (Enter to cancel): ").strip()
@@ -400,11 +438,10 @@ def main():
         print(__doc__)
         sys.exit(0)
 
+    _print_banner()
+
     list_mode = args[0] in ("--list", "-l")
-    if not list_mode:
-        query = " ".join(args)
-    else:
-        query = ""
+    query = "" if list_mode else " ".join(args)
 
     claude_dir = get_claude_dir()
 
@@ -427,15 +464,15 @@ def main():
                 text = entry["text"]
                 cwd = entry["cwd"]
                 first_msg = entry["first_msg"]
-                slug = entry.get("slug", "")
+                name = entry.get("name", "")
             else:
-                text, cwd, first_msg, slug = extract_session(jsonl_file)
+                text, cwd, first_msg, name = extract_session(jsonl_file)
                 cache[key] = {
                     "mtime": mtime,
                     "text": text,
                     "cwd": cwd or str(project_dir),
                     "first_msg": first_msg,
-                    "slug": slug,
+                    "name": name,
                 }
                 updated = True
             if text.strip():
@@ -444,7 +481,7 @@ def main():
                     text,
                     cwd or str(project_dir),
                     first_msg,
-                    slug,
+                    name,
                     jsonl_file,
                 ))
 
@@ -483,7 +520,7 @@ def main():
         print("No results found.", file=sys.stderr)
         sys.exit(1)
 
-    # ranked tuple: (score, session_id, text, cwd, first_msg, slug, jsonl_path)
+    # ranked tuple: (score, session_id, text, cwd, first_msg, name, jsonl_path)
     id_to_path = {r[1]: str(r[6]) for r in ranked}
 
     print(f"Found {len(ranked)} results [{method}] for: '{query}'\n", file=sys.stderr)
