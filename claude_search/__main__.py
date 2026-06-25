@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -209,24 +210,54 @@ def score_sessions(query: str, corpus: list[str]) -> tuple[list[float], str]:
     return _score_tfidf(query, corpus), "TF-IDF"
 
 
-# ── banner ─────────────────────────────────────────────────────────────────────
+# ── banner (animated) ──────────────────────────────────────────────────────────
 
 def _print_banner() -> None:
+    """Animated Claude logo with spinning lens — mirrors the Claude chat animation."""
     if not sys.stderr.isatty():
         return
+
     O  = "\033[38;5;208m"   # orange (Claude brand)
     LO = "\033[38;5;222m"   # light amber
     W  = "\033[1;97m"        # bold white
     D  = "\033[2;37m"        # dim grey
     R  = "\033[0m"           # reset
+    HIDE = "\033[?25l"       # hide cursor
+    SHOW = "\033[?25h"       # show cursor
 
-    print(f"""\
-{O}      .─────.{R}
-{O}     (  {LO} ◉ {O}  )   {W}CLAUDE  SEARCH{R}
-{O}      '─────'   {D}AI Session Explorer{R}
-{O}          \\{R}
-{O}           \\──{R}
-""", file=sys.stderr)
+    # Rotating half-circle characters simulate the Claude logo spin
+    spin = ["◐", "◑", "◒", "◓"]
+
+    def _frame(ch: str) -> str:
+        return (
+            "\n"
+            f"{O}      .─────.{R}\n"
+            f"{O}     (  {LO}{ch}{O}  )   {W}CLAUDE  SEARCH{R}\n"
+            f"{O}      '─────'   {D}AI Session Explorer{R}\n"
+            f"{O}          \\{R}\n"
+            f"{O}           \\──{R}\n"
+        )
+
+    NLINES = 6            # newline count inside _frame()
+    UP = f"\033[{NLINES}A"  # cursor-up to redraw from same position
+
+    try:
+        sys.stderr.write(HIDE)
+        sys.stderr.write(_frame(spin[0]))
+        sys.stderr.flush()
+
+        for i in range(1, 13):   # 12 frames × 80 ms ≈ 1 second
+            time.sleep(0.08)
+            sys.stderr.write(UP)
+            sys.stderr.write(_frame(spin[i % 4]))
+            sys.stderr.flush()
+
+        sys.stderr.write("\n")
+    except Exception:
+        sys.stderr.write(_frame("◉") + "\n")
+    finally:
+        sys.stderr.write(SHOW)
+        sys.stderr.flush()
 
 
 # ── fzf helpers ────────────────────────────────────────────────────────────────
