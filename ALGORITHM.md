@@ -13,7 +13,24 @@ Claude Code salva ogni conversazione in un file `.jsonl` (JSON Lines) nella dire
 - **Linux / Mac**: `~/.claude/projects/<nome-progetto>/<session-id>.jsonl`
 - **Windows**: `%APPDATA%\Claude\projects\<nome-progetto>\<session-id>.jsonl`
 
-Ogni riga del file è un oggetto JSON che rappresenta un messaggio, un tool call, o un evento di sistema. Lo script estrae solo i messaggi di tipo `user` per costruire il testo su cui fare la ricerca.
+Ogni riga del file è un oggetto JSON che rappresenta un messaggio, un tool call, o un evento di sistema. Lo script estrae i messaggi di tipo `user`, ma **filtra il rumore sintetico** generato da Claude Code (vedi sotto) per indicizzare e mostrare in anteprima solo il testo realmente scritto dall'utente.
+
+### Filtro dei messaggi sintetici
+
+Sotto `type: "user"` Claude Code salva anche messaggi che l'utente non ha scritto. Questi vengono scartati (`claude_search/_extract.py`):
+
+- `<local-command-caveat>` — boilerplate "Caveat: the messages below were generated…"
+- `<local-command-stdout>` / `<local-command-stderr>` — output dei comandi slash (es. `/model`, `/effort`)
+- `<bash-stdout>` / `<bash-stderr>` — output dei comandi bash `!`
+- `<task-notification>` — notifiche di task/agent in background
+- `<system-reminder>` — promemoria iniettati dall'harness
+- blocchi `tool_result` (output di tool/MCP), già esclusi perché non sono blocchi `text`
+
+Viene invece **mantenuto** ciò che l'utente ha effettivamente digitato:
+
+- la prosa dei messaggi normali
+- gli **argomenti** dei comandi slash (`<command-args>`) — es. `/deploy prod` → `deploy prod`; i comandi senza argomenti come `/model` vengono scartati perché privi di valore di ricerca
+- l'input dei comandi bash `!` (`<bash-input>`) — es. `! git log` → `git log`
 
 ---
 
