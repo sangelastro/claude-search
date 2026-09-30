@@ -100,6 +100,8 @@ Contenuti dei file scritti (`Write`/`Edit`), blocchi di thinking e output dei to
 
 Lo script apre automaticamente Claude Code nella directory originale della sessione.
 
+Ogni risultato mostra la **data di creazione** e quella di **ultimo aggiornamento** della sessione (primo e ultimo timestamp del file, in ora locale), es. `30/09/26 13:05 -> 30/09/26 15:33`.
+
 **Più account:** le sessioni vengono lette da `$CLAUDE_CONFIG_DIR/projects` se la variabile è impostata (altrimenti `~/.claude/projects`), e la sessione viene ripresa con `claude --resume`, che eredita la stessa variabile. Per cercare su un altro account basta impostarla prima di lanciare il comando (es. `CLAUDE_CONFIG_DIR=~/.claude-personal claude-search ...`).
 
 ---
