@@ -111,3 +111,46 @@ def preview_text(filepath, n: int = 10) -> str:
         if i >= n:
             break
     return "\n".join(lines) if lines else "(no messages)"
+
+
+# ── --all mode: Claude's side of the conversation ─────────────────────────────
+
+# Tool-input fields skipped when indexing tool calls: they carry bulk payloads
+# (whole file contents, edit strings) that would bloat the cache without
+# helping a search. Paths, commands, patterns and descriptions are kept, so a
+# session can be found by a file it wrote or a command it ran.
+_TOOL_SKIP_KEYS = {"content", "old_string", "new_string", "edits", "new_source"}
+
+
+def _tool_input_text(value) -> str:
+    """Flatten the searchable string values of a tool_use `input`."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(
+            _tool_input_text(v) for k, v in value.items() if k not in _TOOL_SKIP_KEYS
+        ).strip()
+    if isinstance(value, list):
+        return " ".join(_tool_input_text(v) for v in value).strip()
+    return ""
+
+
+def assistant_content_to_text(content) -> str:
+    """Extract Claude's reply text and tool-call inputs from an assistant message.
+
+    Thinking blocks and tool results are left out: the former is internal, the
+    latter is tool output (often huge) rather than part of the conversation.
+    """
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            parts.append(block.get("text", ""))
+        elif block.get("type") == "tool_use":
+            parts.append(_tool_input_text(block.get("input", {})))
+    return " ".join(p.strip() for p in parts if p and p.strip())

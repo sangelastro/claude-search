@@ -82,6 +82,16 @@ claude-search "blocco tastierino"
 claude-search "missioni websocket"
 ```
 
+### Cercare anche nelle risposte di Claude (`--all` / `-a`)
+
+Di default si cerca solo in quello che hai scritto tu. Con `--all` vengono indicizzati anche le risposte di Claude e gli input dei tool call (path dei file scritti/modificati, comandi eseguiti, pattern di ricerca): serve per ritrovare una sessione dal **nome di un file che ha generato**.
+
+```bash
+claude-search -a Report_Vendite_Q3_v2
+```
+
+Contenuti dei file scritti (`Write`/`Edit`), blocchi di thinking e output dei tool restano esclusi.
+
 ### Selezione e resume
 
 **Con fzf**: naviga con le frecce, premi `Enter` per aprire la sessione.
@@ -89,6 +99,8 @@ claude-search "missioni websocket"
 **Senza fzf**: inserisci il numero della sessione desiderata e premi `Enter`.
 
 Lo script apre automaticamente Claude Code nella directory originale della sessione.
+
+**Più account:** le sessioni vengono lette da `$CLAUDE_CONFIG_DIR/projects` se la variabile è impostata (altrimenti `~/.claude/projects`), e la sessione viene ripresa con `claude --resume`, che eredita la stessa variabile. Per cercare su un altro account basta impostarla prima di lanciare il comando (es. `CLAUDE_CONFIG_DIR=~/.claude-personal claude-search ...`).
 
 ---
 
