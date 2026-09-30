@@ -3,10 +3,17 @@
 claude-search: Search across Claude Code sessions and resume them.
 
 Usage:
-  claude-search <query>       Search sessions by content
+  claude-search <query>       Search sessions by what you wrote
+  claude-search --all <query> Also search Claude's replies and tool calls
+                              (file paths written/edited, commands run)
+  claude-search -a <query>    (same)
   claude-search --list        List all sessions alphabetically by name
   claude-search -l            (same)
   claude-search "location history cluster"
+  claude-search -a Report_Vendite_Q3_v2
+
+Sessions are read from $CLAUDE_CONFIG_DIR/projects when the variable is set,
+otherwise from ~/.claude/projects.
 
 Requires: python3.11+ (stdlib only)
 Optional:
@@ -29,19 +36,22 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from claude_search._extract import content_to_text
+from claude_search._extract import assistant_content_to_text, content_to_text
 
 
 MAX_RESULTS = 30
 PREVIEW_MESSAGES = 10
 CACHE_PATH = Path.home() / ".cache" / "claude-search" / "index.json"
-# Bumped to 4: extracted text now filters out Claude Code's synthetic
-# messages (command boilerplate/output, notifications, bash output), so the
-# previously cached text is stale and must be rebuilt.
-CACHE_VERSION = 4
+# Bumped to 5: entries also store the assistant-side text used by --all.
+CACHE_VERSION = 5
 
 
 def get_claude_dir() -> Path:
+    # Respect the same variable Claude Code uses to pick the account, so
+    # `CLAUDE_CONFIG_DIR=... claude-search` searches that account's sessions.
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        return Path(config_dir).expanduser() / "projects"
     system = platform.system()
     if system == "Windows":
         base = Path(os.environ.get("APPDATA", Path.home()))
@@ -75,15 +85,19 @@ def _save_cache(cache: dict) -> None:
 # ── text extraction ────────────────────────────────────────────────────────────
 
 def extract_session(filepath: Path):
-    """Return (full_text, cwd, first_user_msg, name) from a JSONL session file.
+    """Return (full_text, assistant_text, cwd, first_user_msg, name) from a JSONL session file.
 
     Only user-authored text is kept (see ``_extract.content_to_text``):
     Claude Code's synthetic messages — command boilerplate/output, task
     notifications, system reminders and `!` bash output — are filtered out.
 
+    ``assistant_text`` holds Claude's replies and tool-call inputs, searched
+    only with --all.
+
     name priority: customTitle (from /rename) > slug (auto-generated) > ""
     """
     texts = []
+    assistant_texts = []
     cwd = None
     first_user_msg = None
     custom_title = None
@@ -105,6 +119,12 @@ def extract_session(filepath: Path):
             if not slug and obj.get("slug"):
                 slug = obj["slug"]
 
+            if obj.get("type") == "assistant":
+                text = assistant_content_to_text(obj.get("message", {}).get("content", ""))
+                if text:
+                    assistant_texts.append(text)
+                continue
+
             if obj.get("type") != "user":
                 continue
 
@@ -117,7 +137,7 @@ def extract_session(filepath: Path):
                 cwd = obj["cwd"]
 
     name = custom_title or slug or ""
-    return " ".join(texts), cwd, first_user_msg or "", name
+    return " ".join(texts), " ".join(assistant_texts), cwd, first_user_msg or "", name
 
 
 # ── scoring ────────────────────────────────────────────────────────────────────
@@ -130,7 +150,15 @@ except ImportError:
 
 
 def tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-zA-Z0-9àèéìòùÀÈÉÌÒÙ_]+", text.lower())
+    # Identifiers like `Report_Vendite_Q3_v2_2026` are kept whole and
+    # also split on `_`, so a partial name (`Report_Vendite_Q3_v2`)
+    # still matches through its parts.
+    tokens = []
+    for tok in re.findall(r"[a-zA-Z0-9àèéìòùÀÈÉÌÒÙ_]+", text.lower()):
+        tokens.append(tok)
+        if "_" in tok:
+            tokens.extend(p for p in tok.split("_") if p)
+    return tokens
 
 
 def _score_bm25(query: str, corpus: list[str]) -> list[float]:
@@ -482,6 +510,12 @@ def main():
 
     _print_banner()
 
+    all_mode = any(a in ("--all", "-a") for a in args)
+    args = [a for a in args if a not in ("--all", "-a")]
+    if not args:
+        print(__doc__)
+        sys.exit(0)
+
     list_mode = args[0] in ("--list", "-l")
     query = "" if list_mode else " ".join(args)
 
@@ -504,19 +538,23 @@ def main():
             entry = cache.get(key)
             if entry and entry.get("mtime") == mtime:
                 text = entry["text"]
+                assistant_text = entry.get("assistant_text", "")
                 cwd = entry["cwd"]
                 first_msg = entry["first_msg"]
                 name = entry.get("name", "")
             else:
-                text, cwd, first_msg, name = extract_session(jsonl_file)
+                text, assistant_text, cwd, first_msg, name = extract_session(jsonl_file)
                 cache[key] = {
                     "mtime": mtime,
                     "text": text,
+                    "assistant_text": assistant_text,
                     "cwd": cwd or str(project_dir),
                     "first_msg": first_msg,
                     "name": name,
                 }
                 updated = True
+            if all_mode:
+                text = f"{text} {assistant_text}"
             if text.strip():
                 sessions.append((
                     jsonl_file.stem,
@@ -559,13 +597,15 @@ def main():
     ][:MAX_RESULTS]
 
     if not ranked:
-        print("No results found.", file=sys.stderr)
+        hint = "" if all_mode else "  (only your messages were searched; try --all)"
+        print("No results found." + hint, file=sys.stderr)
         sys.exit(1)
 
     # ranked tuple: (score, session_id, text, cwd, first_msg, name, jsonl_path)
     id_to_path = {r[1]: str(r[6]) for r in ranked}
 
-    print(f"Found {len(ranked)} results [{method}] for: '{query}'\n", file=sys.stderr)
+    scope = " incl. Claude's replies" if all_mode else ""
+    print(f"Found {len(ranked)} results [{method}{scope}] for: '{query}'\n", file=sys.stderr)
 
     selection = (
         _fzf_select(ranked, query, id_to_path)

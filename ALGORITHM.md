@@ -12,6 +12,7 @@ Claude Code salva ogni conversazione in un file `.jsonl` (JSON Lines) nella dire
 
 - **Linux / Mac**: `~/.claude/projects/<nome-progetto>/<session-id>.jsonl`
 - **Windows**: `%APPDATA%\Claude\projects\<nome-progetto>\<session-id>.jsonl`
+- Se è impostata `CLAUDE_CONFIG_DIR` (più account): `$CLAUDE_CONFIG_DIR/projects/...`, che ha la precedenza
 
 Ogni riga del file è un oggetto JSON che rappresenta un messaggio, un tool call, o un evento di sistema. Lo script estrae i messaggi di tipo `user`, ma **filtra il rumore sintetico** generato da Claude Code (vedi sotto) per indicizzare e mostrare in anteprima solo il testo realmente scritto dall'utente.
 
@@ -31,6 +32,10 @@ Viene invece **mantenuto** ciò che l'utente ha effettivamente digitato:
 - la prosa dei messaggi normali
 - gli **argomenti** dei comandi slash (`<command-args>`) — es. `/deploy prod` → `deploy prod`; i comandi senza argomenti come `/model` vengono scartati perché privi di valore di ricerca
 - l'input dei comandi bash `!` (`<bash-input>`) — es. `! git log` → `git log`
+
+### Modalità `--all`
+
+Con `--all` al testo dell'utente si aggiunge quello dei messaggi `assistant`: i blocchi `text` e gli `input` dei `tool_use`, esclusi i campi con payload voluminosi (`content`, `old_string`, `new_string`, `edits`, `new_source`). Restano fuori thinking e `tool_result`. Il testo assistant è salvato in cache sempre (campo `assistant_text`) ma entra nello scoring solo con `--all`.
 
 ---
 
@@ -111,6 +116,7 @@ re.findall(r"[a-zA-Z0-9àèéìòùÀÈÉÌÒÙ_]+", text.lower())
 - Tutto minuscolo
 - Supporta caratteri accentati italiani
 - Separa su spazi, punteggiatura, simboli
+- Gli identificatori con `_` vengono tenuti interi **e** spezzati nei loro pezzi: `report_vendite_q3_v2_2026` produce anche `report`, `vendite`, `q3`, `v2`, `2026`, così un nome parziale trova comunque la sessione
 
 Non viene applicato stemming né stop-word removal: la semplicità è preferita per un tool locale con corpus piccolo.
 
