@@ -92,6 +92,22 @@ claude-search -a Report_Vendite_Q3_v2
 
 Contenuti dei file scritti (`Write`/`Edit`), blocchi di thinking e output dei tool restano esclusi.
 
+### Elenco e ordinamento (`--list` / `--sort`)
+
+```bash
+claude-search --list                 # tutte le sessioni, dalla più aggiornata alla meno recente
+claude-search --list --sort name     # in ordine alfabetico per nome
+claude-search --sort date redis      # ricerca, risultati ordinati per data invece che per score
+```
+
+| Ordinamento | Significato | Default per |
+|---|---|---|
+| `score` | rilevanza rispetto alla query | ricerca |
+| `date` | ultimo aggiornamento, dal più recente | `--list` |
+| `name` | nome della sessione (`/rename`), quelle senza nome in fondo | — |
+
+Forme accettate: `--sort date`, `--sort=date`, `-s date`. Nell'interfaccia fzf l'ordinamento si cambia al volo: `ctrl-s` score, `ctrl-d` data, `ctrl-n` nome. Mentre scrivi un filtro in fzf l'ordine scelto viene mantenuto.
+
 ### Selezione e resume
 
 **Con fzf**: naviga con le frecce, premi `Enter` per aprire la sessione.
@@ -100,7 +116,7 @@ Contenuti dei file scritti (`Write`/`Edit`), blocchi di thinking e output dei to
 
 Lo script apre automaticamente Claude Code nella directory originale della sessione.
 
-Ogni risultato mostra la **data di creazione** e quella di **ultimo aggiornamento** della sessione (primo e ultimo timestamp del file, in ora locale), es. `30/09/26 13:05 -> 30/09/26 15:33`.
+I risultati sono una tabella a colonne: score (solo in ricerca), **creata**, **aggiornata** (primo e ultimo timestamp del file, in ora locale, es. `30/09/26 13:05`), nome, cartella, primo messaggio. I testi incollati da Windows (`\r\n`), i tab e i codici colore vengono ridotti a una riga, così righe e anteprima non strabordano.
 
 **Più account:** le sessioni vengono lette da `$CLAUDE_CONFIG_DIR/projects` se la variabile è impostata (altrimenti `~/.claude/projects`), e la sessione viene ripresa con `claude --resume`, che eredita la stessa variabile. Per cercare su un altro account basta impostarla prima di lanciare il comando (es. `CLAUDE_CONFIG_DIR=~/.claude-personal claude-search ...`).
 

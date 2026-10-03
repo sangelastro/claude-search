@@ -7,10 +7,17 @@ Usage:
   claude-search --all <query> Also search Claude's replies and tool calls
                               (file paths written/edited, commands run)
   claude-search -a <query>    (same)
-  claude-search --list        List all sessions alphabetically by name
+  claude-search --list        List all sessions, most recently updated first
   claude-search -l            (same)
+  claude-search --sort date <query>
+                              Order results by: score (default for a search),
+                              date (last update, newest first; default for
+                              --list) or name. Also: -s date, --sort=date
   claude-search "location history cluster"
   claude-search -a Report_Vendite_Q3_v2
+
+In the fzf UI the order can also be switched on the fly:
+  ctrl-s = score   ctrl-d = date   ctrl-n = name
 
 Sessions are read from $CLAUDE_CONFIG_DIR/projects when the variable is set,
 otherwise from ~/.claude/projects.
@@ -28,20 +35,25 @@ import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
-from claude_search._extract import assistant_content_to_text, content_to_text
+from claude_search._extract import (
+    assistant_content_to_text, content_to_text, display_width, fit, one_line,
+)
 
 
 MAX_RESULTS = 30
 PREVIEW_MESSAGES = 10
+SORT_KEYS = ("score", "date", "name")
 CACHE_PATH = Path.home() / ".cache" / "claude-search" / "index.json"
 # Bumped to 6: entries also store the session's created/updated timestamps.
 CACHE_VERSION = 6
@@ -154,16 +166,34 @@ def extract_session(filepath: Path):
     )
 
 
-def format_dates(created: str, updated: str) -> str:
-    """Render "created -> updated" in local time, e.g. "30/09/26 13:05 -> 30/09/26 15:33"."""
-    def fmt(ts: str) -> str:
-        try:
-            return datetime.fromisoformat(ts).astimezone().strftime("%d/%m/%y %H:%M")
-        except (ValueError, TypeError):
-            return "?"
-    if not created:
-        return "?"
-    return f"{fmt(created)} -> {fmt(updated or created)}"
+class Session(NamedTuple):
+    session_id: str
+    text: str
+    cwd: str
+    first_msg: str
+    name: str
+    path: Path
+    created: str   # ISO timestamps, "" if unknown
+    updated: str
+
+
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def parse_ts(ts: str) -> datetime:
+    """ISO timestamp -> aware datetime (epoch if missing/invalid, so it sorts last)."""
+    try:
+        # "Z" suffix: accepted by fromisoformat only from Python 3.11.
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return _EPOCH
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def fmt_ts(ts: str) -> str:
+    """Render an ISO timestamp in local time, e.g. "30/09/26 13:05" ("?" if unknown)."""
+    dt = parse_ts(ts)
+    return "?" if dt == _EPOCH else dt.astimezone().strftime("%d/%m/%y %H:%M")
 
 
 # ── scoring ────────────────────────────────────────────────────────────────────
@@ -334,6 +364,17 @@ def _print_banner() -> None:
 
 # ── fzf helpers ────────────────────────────────────────────────────────────────
 
+_IS_WINDOWS = platform.system() == "Windows"
+
+
+def _quote(arg: str) -> str:
+    """Quote ``arg`` for the shell fzf runs preview/reload commands with.
+
+    fzf uses cmd.exe on Windows (see ``_run_fzf``) and $SHELL / sh elsewhere.
+    """
+    return f'"{arg}"' if _IS_WINDOWS else shlex.quote(arg)
+
+
 def _make_preview_cmd(id_to_path: dict, tmpdir: str, field: int = 2) -> str:
     """Build fzf preview shell command. `field` is the 1-based fzf field with the session_id."""
     # The preview runs in a separate Python subprocess spawned by fzf, so it
@@ -346,168 +387,178 @@ def _make_preview_cmd(id_to_path: dict, tmpdir: str, field: int = 2) -> str:
         f.write(f"sys.path.insert(0, {json.dumps(pkg_parent)})\n")
         f.write("from claude_search._extract import preview_text\n")
         f.write(f"id_to_path = {json.dumps(id_to_path)}\n")
+        # fzf quotes the placeholder its own way per shell/version (e.g. ^"id^"
+        # on cmd, 'id' on sh): keep only the UUID characters so the lookup
+        # never depends on that.
         f.write(
-            "sid = sys.argv[1].strip() if len(sys.argv) > 1 else ''\n"
+            "import re\n"
+            "sid = re.sub(r'[^0-9A-Za-z-]', '', sys.argv[1]) if len(sys.argv) > 1 else ''\n"
             "path = id_to_path.get(sid)\n"
             f"print(preview_text(path, {PREVIEW_MESSAGES}) if path else '(not found)')\n"
         )
 
-    fld_placeholder = f"{{{field}}}"   # fzf substitution, e.g. {3}
-    is_windows = platform.system() == "Windows"
-    if is_windows:
+    fld_placeholder = f"{{{field}}}"   # fzf substitution, e.g. {2}
+    if _IS_WINDOWS:
         preview_bat = os.path.join(tmpdir, "preview.bat")
         with open(preview_bat, "w", encoding="utf-8") as f:
             # fzf passes the extracted field as the FIRST argument to the bat;
             # use %1 regardless of which field number was selected.
             f.write(f'@echo off\n"{sys.executable}" "{preview_script}" %1\n')
-        return f"{preview_bat} {fld_placeholder}"
-    else:
-        os.chmod(preview_script, 0o755)
-        return f"{sys.executable} {preview_script} {fld_placeholder}"
+        return f"{_quote(preview_bat)} {fld_placeholder}"
+    return f"{_quote(sys.executable)} {_quote(preview_script)} {fld_placeholder}"
 
 
-def _run_fzf(fzf_lines: list[str], header: str, preview_cmd: str, with_nth: str) -> str | None:
-    """Run fzf and return the selected line, or None if cancelled."""
-    tmpdir = tempfile.mkdtemp(prefix="claude-search-")
-    input_file = os.path.join(tmpdir, "input.txt")
-    output_file = os.path.join(tmpdir, "output.txt")
-    try:
-        with open(input_file, "w", encoding="utf-8") as f:
-            f.write("\n".join(fzf_lines))
-        subprocess.run(
-            f'fzf'
-            f' --delimiter="|"'
-            f' --with-nth={with_nth}'
-            f' --preview="{preview_cmd}"'
-            f' --preview-window=down:40%:wrap'
-            f' --height=90%'
-            f' --layout=reverse'
-            f' --border'
-            f' --header="{header}"'
-            f' --prompt="Select session > "'
-            f' < "{input_file}"'
-            f' > "{output_file}"',
-            shell=True,
-        )
-        return open(output_file, encoding="utf-8").read().strip() or None
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+def _cat_cmd(path: str) -> str:
+    """Shell command fzf runs on reload to print ``path`` (a .bat on Windows, like the preview)."""
+    if _IS_WINDOWS:
+        bat = os.path.splitext(path)[0] + ".bat"
+        with open(bat, "w", encoding="utf-8") as f:
+            f.write(f'@type "{path}"\n')
+        return _quote(bat)
+    return f"cat {_quote(path)}"
 
 
-# ── selection UI (search mode) ─────────────────────────────────────────────────
+def _run_fzf(input_file: str, header: str, preview_cmd: str, binds: list[str]) -> str | None:
+    """Run fzf on ``input_file`` and return the selected line, or None if cancelled.
 
-# Search fzf line:  pct% | name | session_id | dates | cwd | first_msg
-#   displayed (--with-nth=1,2,4,5,6): score%, name, dates, cwd, first_msg
-#   field 3 = session_id (hidden, used by preview via {3})
-#   parse: parts[2]=session_id, parts[4]=cwd
+    Input lines are "row<TAB>session_id<TAB>cwd": only the row is shown
+    (--with-nth=1) and the first line holds the column titles (--header-lines).
+    --no-sort keeps our order (score / date / name) while typing a filter.
 
-def _fzf_select(ranked, query: str, id_to_path: dict) -> tuple[str, str] | None:
-    """Search results with fzf. Returns (session_id, cwd) or None."""
-    max_score = ranked[0][0] if ranked else 1.0
-    tmpdir = tempfile.mkdtemp(prefix="claude-search-")
-    try:
-        preview_cmd = _make_preview_cmd(id_to_path, tmpdir, field=3)
-        fzf_lines = []
-        for score, session_id, _, cwd, first_msg, name, _, dates in ranked:
-            pct = int(score / max_score * 100) if max_score > 0 else 0
-            label = first_msg[:80].replace("\n", " ")
-            short_cwd = cwd.replace(str(Path.home()), "~")
-            name_col = name if name else "(no name)"
-            fzf_lines.append(f"{pct:3d}% | {name_col} | {session_id} | {dates} | {short_cwd} | {label}")
-
-        header = f"Search: {query} — {len(ranked)} results"
-        selected = _run_fzf(fzf_lines, header, preview_cmd, with_nth="1,2,4,5,6")
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-    if not selected:
-        return None
-    parts = [p.strip() for p in selected.split("|")]
-    # parts[2]=session_id, parts[4]=cwd
-    return parts[2], parts[4].replace("~", str(Path.home()))
-
-
-def _list_select(ranked) -> tuple[str, str] | None:
-    """Numbered list fallback for search (no fzf). Returns (session_id, cwd) or None."""
-    max_score = ranked[0][0] if ranked else 1.0
-    print(file=sys.stderr)
-    for i, (score, session_id, _, cwd, first_msg, name, _, dates) in enumerate(ranked, 1):
-        pct = int(score / max_score * 100) if max_score > 0 else 0
-        short_cwd = cwd.replace(str(Path.home()), "~")
-        label = first_msg[:90].replace("\n", " ")
-        name_str = f" [{name}]" if name else ""
-        print(f"  {i:2}. {pct:3d}%{name_str} {label}", file=sys.stderr)
-        print(f"       {dates}  {short_cwd}  ({session_id[:8]}...)\n", file=sys.stderr)
-
-    choice = input("Select number (Enter to cancel): ").strip()
-    if not choice:
-        return None
-    try:
-        idx = int(choice) - 1
-        _, chosen_id, _, chosen_cwd, _, _, _, _ = ranked[idx]
-        return chosen_id, chosen_cwd
-    except (ValueError, IndexError):
-        print("Invalid selection.", file=sys.stderr)
-        return None
+    fzf is started with an argument list, not through a shell, so the same
+    call works on Windows and Linux without per-shell quoting.
+    """
+    cmd = [
+        shutil.which("fzf") or "fzf",
+        "--delimiter=\t",
+        "--with-nth=1",
+        "--header-lines=1",
+        "--no-sort",
+        f"--preview={preview_cmd}",
+        "--preview-window=down:40%:wrap",
+        "--height=90%",
+        "--layout=reverse",
+        "--border",
+        f"--header={header}",
+        "--prompt=Select session > ",
+    ] + [f"--bind={b}" for b in binds]
+    env = os.environ.copy()
+    if _IS_WINDOWS:
+        # With $SHELL set (e.g. launched from Git Bash) fzf would run the .bat
+        # helpers through bash, which mangles their Windows paths: drop it so
+        # fzf falls back to cmd.exe.
+        env.pop("SHELL", None)
+    with open(input_file, "rb") as stdin:
+        proc = subprocess.run(cmd, stdin=stdin, stdout=subprocess.PIPE, env=env)
+    return proc.stdout.decode("utf-8", errors="replace").strip() or None
 
 
-# ── selection UI (alphabetical list mode) ─────────────────────────────────────
+# ── result table ───────────────────────────────────────────────────────────────
 
-# List fzf line:  name | session_id | dates | cwd | first_msg
-#   displayed (--with-nth=1,3,4,5): name, dates, cwd, first_msg
-#   field 2 = session_id (hidden, used by preview via {2})
-#   parse: parts[1]=session_id, parts[3]=cwd
+# A result is (pct, Session): pct = score relative to the best match, None in
+# --list mode (no score column).
 
-def _fzf_list_all(sessions, id_to_path: dict) -> tuple[str, str] | None:
-    """Alphabetical list of all sessions with fzf. Returns (session_id, cwd) or None."""
+_W_SCORE, _W_DATE, _W_NAME, _W_CWD, _W_MSG = 5, 14, 30, 28, 100
+
+_SORT_BINDS = {"score": "ctrl-s", "date": "ctrl-d", "name": "ctrl-n"}
+_SORT_LABELS = {"score": "score", "date": "last update", "name": "name"}
+
+
+def _table_header(show_score: bool) -> str:
+    cols = [fit("Score", _W_SCORE)] if show_score else []
+    cols += [
+        fit("Created", _W_DATE), fit("Updated", _W_DATE),
+        fit("Name", _W_NAME), fit("Directory", _W_CWD), "First message",
+    ]
+    return "  ".join(cols)
+
+
+def _table_row(pct: int | None, s: Session) -> str:
+    cols = [fit(f"{pct:3d}%", _W_SCORE)] if pct is not None else []
+    cols += [
+        fit(fmt_ts(s.created), _W_DATE),
+        fit(fmt_ts(s.updated), _W_DATE),
+        fit(one_line(s.name) or "(no name)", _W_NAME),
+        fit(one_line(s.cwd.replace(str(Path.home()), "~")), _W_CWD, keep_end=True),
+        fit(one_line(s.first_msg), _W_MSG).rstrip(),
+    ]
+    return "  ".join(cols)
+
+
+def order_results(results: list, by: str) -> list:
+    """Sort results by "score" (best first), "date" (last update, newest first) or "name"."""
+    if by == "date":
+        return sorted(results, key=lambda r: parse_ts(r[1].updated), reverse=True)
+    if by == "name":
+        # Named sessions first, alphabetically; unnamed ones by first message.
+        return sorted(results, key=lambda r: (not r[1].name, r[1].name.lower(),
+                                              r[1].first_msg[:60].lower()))
+    return sorted(results, key=lambda r: r[0] or 0, reverse=True)
+
+
+def _header_text(title: str, by: str, sorts: tuple) -> str:
+    keys = "  ".join(f"{_SORT_BINDS[b]} {_SORT_LABELS[b]}" for b in sorts)
+    # Header goes inside --header="..." and change-header(...): keep it free
+    # of quotes and parentheses.
+    text = f"{title} - sorted by {_SORT_LABELS[by]}   [{keys}]"
+    return re.sub(r'["()]', "", text)
+
+
+# ── selection UI ───────────────────────────────────────────────────────────────
+
+def _fzf_select(results, sorts: tuple, initial: str, title: str,
+                id_to_path: dict) -> tuple[str, str] | None:
+    """Pick a session with fzf; ctrl-s / ctrl-d / ctrl-n re-sort the list.
+
+    One input file per sort order is written up front; the key bindings just
+    reload the matching file. Returns (session_id, cwd) or None.
+    """
+    show_score = "score" in sorts
     tmpdir = tempfile.mkdtemp(prefix="claude-search-")
     try:
         preview_cmd = _make_preview_cmd(id_to_path, tmpdir, field=2)
-        # sessions tuple: (session_id, text, cwd, first_msg, name, jsonl_path, dates)
-        sorted_sessions = sorted(
-            sessions,
-            key=lambda s: (s[4].lower() if s[4] else "\xff", s[3][:60].lower()),
+        header_line = _table_header(show_score) + "\t\t"
+        binds = []
+        for by in sorts:
+            path = os.path.join(tmpdir, f"by_{by}.txt")
+            lines = [header_line] + [
+                f"{_table_row(pct, s)}\t{s.session_id}\t{s.cwd}"
+                for pct, s in order_results(results, by)
+            ]
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            binds.append(
+                f"{_SORT_BINDS[by]}:reload({_cat_cmd(path)})"
+                f"+change-header({_header_text(title, by, sorts)})+first"
+            )
+        selected = _run_fzf(
+            os.path.join(tmpdir, f"by_{initial}.txt"),
+            _header_text(title, initial, sorts), preview_cmd, binds,
         )
-        fzf_lines = []
-        for session_id, _, cwd, first_msg, name, _, dates in sorted_sessions:
-            label = first_msg[:80].replace("\n", " ")
-            short_cwd = cwd.replace(str(Path.home()), "~")
-            name_col = name if name else f"({first_msg[:40].replace(chr(10), ' ')})"
-            fzf_lines.append(f"{name_col} | {session_id} | {dates} | {short_cwd} | {label}")
-
-        header = f"All sessions — {len(sessions)} total (alphabetical)"
-        selected = _run_fzf(fzf_lines, header, preview_cmd, with_nth="1,3,4,5")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     if not selected:
         return None
-    parts = [p.strip() for p in selected.split("|")]
-    # parts[1]=session_id, parts[3]=cwd
-    return parts[1], parts[3].replace("~", str(Path.home()))
+    parts = selected.split("\t")
+    return parts[1], parts[2]
 
 
-def _list_all_select(sessions) -> tuple[str, str] | None:
-    """Numbered alphabetical list fallback (no fzf). Returns (session_id, cwd) or None."""
-    # sessions tuple: (session_id, text, cwd, first_msg, name, jsonl_path, dates)
-    sorted_sessions = sorted(
-        sessions,
-        key=lambda s: (s[4].lower() if s[4] else "\xff", s[3][:60].lower()),
-    )
+def _numbered_select(results, initial: str, show_score: bool) -> tuple[str, str] | None:
+    """Numbered table fallback (no fzf). Returns (session_id, cwd) or None."""
+    ordered = order_results(results, initial)
     print(file=sys.stderr)
-    for i, (session_id, _, cwd, first_msg, name, _, dates) in enumerate(sorted_sessions, 1):
-        short_cwd = cwd.replace(str(Path.home()), "~")
-        display_name = name if name else f"({first_msg[:40].replace(chr(10), ' ')})"
-        print(f"  {i:3}. {display_name}", file=sys.stderr)
-        print(f"        {dates}  {short_cwd}  ({session_id[:8]}...)\n", file=sys.stderr)
+    print(f"        {_table_header(show_score)}", file=sys.stderr)
+    for i, (pct, s) in enumerate(ordered, 1):
+        print(f"  {i:4}. {_table_row(pct, s)}", file=sys.stderr)
+    print(file=sys.stderr)
 
     choice = input("Select number (Enter to cancel): ").strip()
     if not choice:
         return None
     try:
-        idx = int(choice) - 1
-        chosen = sorted_sessions[idx]
-        return chosen[0], chosen[2]
+        _, chosen = ordered[int(choice) - 1]
+        return chosen.session_id, chosen.cwd
     except (ValueError, IndexError):
         print("Invalid selection.", file=sys.stderr)
         return None
@@ -527,12 +578,31 @@ def resume(session_id: str, cwd: str) -> None:
 
 # ── main ───────────────────────────────────────────────────────────────────────
 
+def _parse_sort(args: list[str]) -> tuple[list[str], str | None]:
+    """Pull --sort X / --sort=X / -s X out of ``args``. Returns (rest, sort_by)."""
+    rest, sort_by = [], None
+    it = iter(args)
+    for a in it:
+        if a in ("--sort", "-s"):
+            sort_by = next(it, "")
+        elif a.startswith("--sort="):
+            sort_by = a.split("=", 1)[1]
+        else:
+            rest.append(a)
+    if sort_by is not None and sort_by not in SORT_KEYS:
+        print(f"Invalid --sort '{sort_by}': use one of {', '.join(SORT_KEYS)}.", file=sys.stderr)
+        sys.exit(2)
+    return rest, sort_by
+
+
 def main():
     args = sys.argv[1:]
 
     if not args or args[0] in ("-h", "--help"):
         print(__doc__)
         sys.exit(0)
+
+    args, sort_by = _parse_sort(args)
 
     _print_banner()
 
@@ -587,14 +657,9 @@ def main():
             if all_mode:
                 text = f"{text} {assistant_text}"
             if text.strip():
-                sessions.append((
-                    jsonl_file.stem,
-                    text,
-                    cwd or str(project_dir),
-                    first_msg,
-                    name,
-                    jsonl_file,
-                    format_dates(created, last_update),
+                sessions.append(Session(
+                    jsonl_file.stem, text, cwd or str(project_dir), first_msg,
+                    name, jsonl_file, created, last_update,
                 ))
 
     if updated:
@@ -607,44 +672,43 @@ def main():
     has_fzf = shutil.which("fzf") is not None and sys.stdin.isatty()
 
     if list_mode:
-        print(f"Listing {len(sessions)} sessions alphabetically ...\n", file=sys.stderr)
-        id_to_path = {s[0]: str(s[5]) for s in sessions}
-        selection = (
-            _fzf_list_all(sessions, id_to_path)
-            if has_fzf
-            else _list_all_select(sessions)
-        )
-        if selection:
-            resume(*selection)
-        return
+        if sort_by == "score":
+            print("--sort score needs a search query; sorting by date.", file=sys.stderr)
+        sort_by = sort_by if sort_by in ("date", "name") else "date"
+        results = [(None, s) for s in sessions]
+        sorts = ("date", "name")
+        title = f"All sessions: {len(sessions)}"
+        print(f"Listing {len(sessions)} sessions by {_SORT_LABELS[sort_by]} ...\n", file=sys.stderr)
+    else:
+        print(f"Indexing {len(sessions)} sessions ...", file=sys.stderr)
 
-    print(f"Indexing {len(sessions)} sessions ...", file=sys.stderr)
+        scores, method = score_sessions(query, [s.text for s in sessions])
+        ranked = [
+            (score, sess)
+            for score, sess in sorted(zip(scores, sessions), key=lambda x: x[0], reverse=True)
+            if score > 0
+        ][:MAX_RESULTS]
 
-    scores, method = score_sessions(query, [s[1] for s in sessions])
+        if not ranked:
+            hint = "" if all_mode else "  (only your messages were searched; try --all)"
+            print("No results found." + hint, file=sys.stderr)
+            sys.exit(1)
 
-    ranked = [
-        (score, *sess)
-        for score, sess in sorted(zip(scores, sessions), key=lambda x: x[0], reverse=True)
-        if score > 0
-    ][:MAX_RESULTS]
+        max_score = ranked[0][0]
+        results = [(int(score / max_score * 100) if max_score > 0 else 0, s) for score, s in ranked]
+        sort_by = sort_by or "score"
+        sorts = SORT_KEYS
+        title = f"Search: {query}: {len(results)} results"
 
-    if not ranked:
-        hint = "" if all_mode else "  (only your messages were searched; try --all)"
-        print("No results found." + hint, file=sys.stderr)
-        sys.exit(1)
+        scope = " incl. Claude's replies" if all_mode else ""
+        print(f"Found {len(results)} results [{method}{scope}] for: '{query}'\n", file=sys.stderr)
 
-    # ranked tuple: (score, session_id, text, cwd, first_msg, name, jsonl_path, dates)
-    id_to_path = {r[1]: str(r[6]) for r in ranked}
-
-    scope = " incl. Claude's replies" if all_mode else ""
-    print(f"Found {len(ranked)} results [{method}{scope}] for: '{query}'\n", file=sys.stderr)
-
+    id_to_path = {s.session_id: str(s.path) for _, s in results}
     selection = (
-        _fzf_select(ranked, query, id_to_path)
+        _fzf_select(results, sorts, sort_by, title, id_to_path)
         if has_fzf
-        else _list_select(ranked)
+        else _numbered_select(results, sort_by, show_score=not list_mode)
     )
-
     if selection:
         resume(*selection)
 
