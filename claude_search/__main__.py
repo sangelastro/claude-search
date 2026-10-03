@@ -35,6 +35,7 @@ import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -182,8 +183,9 @@ _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 def parse_ts(ts: str) -> datetime:
     """ISO timestamp -> aware datetime (epoch if missing/invalid, so it sorts last)."""
     try:
-        dt = datetime.fromisoformat(ts)
-    except (ValueError, TypeError):
+        # "Z" suffix: accepted by fromisoformat only from Python 3.11.
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
         return _EPOCH
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
@@ -362,6 +364,17 @@ def _print_banner() -> None:
 
 # ── fzf helpers ────────────────────────────────────────────────────────────────
 
+_IS_WINDOWS = platform.system() == "Windows"
+
+
+def _quote(arg: str) -> str:
+    """Quote ``arg`` for the shell fzf runs preview/reload commands with.
+
+    fzf uses cmd.exe on Windows (see ``_run_fzf``) and $SHELL / sh elsewhere.
+    """
+    return f'"{arg}"' if _IS_WINDOWS else shlex.quote(arg)
+
+
 def _make_preview_cmd(id_to_path: dict, tmpdir: str, field: int = 2) -> str:
     """Build fzf preview shell command. `field` is the 1-based fzf field with the session_id."""
     # The preview runs in a separate Python subprocess spawned by fzf, so it
@@ -374,34 +387,35 @@ def _make_preview_cmd(id_to_path: dict, tmpdir: str, field: int = 2) -> str:
         f.write(f"sys.path.insert(0, {json.dumps(pkg_parent)})\n")
         f.write("from claude_search._extract import preview_text\n")
         f.write(f"id_to_path = {json.dumps(id_to_path)}\n")
+        # fzf quotes the placeholder its own way per shell/version (e.g. ^"id^"
+        # on cmd, 'id' on sh): keep only the UUID characters so the lookup
+        # never depends on that.
         f.write(
-            "sid = sys.argv[1].strip() if len(sys.argv) > 1 else ''\n"
+            "import re\n"
+            "sid = re.sub(r'[^0-9A-Za-z-]', '', sys.argv[1]) if len(sys.argv) > 1 else ''\n"
             "path = id_to_path.get(sid)\n"
             f"print(preview_text(path, {PREVIEW_MESSAGES}) if path else '(not found)')\n"
         )
 
-    fld_placeholder = f"{{{field}}}"   # fzf substitution, e.g. {3}
-    is_windows = platform.system() == "Windows"
-    if is_windows:
+    fld_placeholder = f"{{{field}}}"   # fzf substitution, e.g. {2}
+    if _IS_WINDOWS:
         preview_bat = os.path.join(tmpdir, "preview.bat")
         with open(preview_bat, "w", encoding="utf-8") as f:
             # fzf passes the extracted field as the FIRST argument to the bat;
             # use %1 regardless of which field number was selected.
             f.write(f'@echo off\n"{sys.executable}" "{preview_script}" %1\n')
-        return f"{preview_bat} {fld_placeholder}"
-    else:
-        os.chmod(preview_script, 0o755)
-        return f"{sys.executable} {preview_script} {fld_placeholder}"
+        return f"{_quote(preview_bat)} {fld_placeholder}"
+    return f"{_quote(sys.executable)} {_quote(preview_script)} {fld_placeholder}"
 
 
 def _cat_cmd(path: str) -> str:
-    """Shell command fzf runs on reload to print ``path`` (same trick as the preview .bat)."""
-    if platform.system() == "Windows":
+    """Shell command fzf runs on reload to print ``path`` (a .bat on Windows, like the preview)."""
+    if _IS_WINDOWS:
         bat = os.path.splitext(path)[0] + ".bat"
         with open(bat, "w", encoding="utf-8") as f:
             f.write(f'@type "{path}"\n')
-        return bat
-    return f"cat '{path}'"
+        return _quote(bat)
+    return f"cat {_quote(path)}"
 
 
 def _run_fzf(input_file: str, header: str, preview_cmd: str, binds: list[str]) -> str | None:
@@ -410,34 +424,33 @@ def _run_fzf(input_file: str, header: str, preview_cmd: str, binds: list[str]) -
     Input lines are "row<TAB>session_id<TAB>cwd": only the row is shown
     (--with-nth=1) and the first line holds the column titles (--header-lines).
     --no-sort keeps our order (score / date / name) while typing a filter.
+
+    fzf is started with an argument list, not through a shell, so the same
+    call works on Windows and Linux without per-shell quoting.
     """
-    output_file = input_file + ".out"
-    # Pin the shell on Windows: preview and reload commands are .bat files.
-    shell_opt = ' --with-shell="cmd /s /c"' if platform.system() == "Windows" else ""
-    bind_opts = "".join(f' --bind="{b}"' for b in binds)
-    subprocess.run(
-        f'fzf'
-        f' --delimiter="\t"'
-        f' --with-nth=1'
-        f' --header-lines=1'
-        f' --no-sort'
-        f'{shell_opt}'
-        f'{bind_opts}'
-        f' --preview="{preview_cmd}"'
-        f' --preview-window=down:40%:wrap'
-        f' --height=90%'
-        f' --layout=reverse'
-        f' --border'
-        f' --header="{header}"'
-        f' --prompt="Select session > "'
-        f' < "{input_file}"'
-        f' > "{output_file}"',
-        shell=True,
-    )
-    try:
-        return open(output_file, encoding="utf-8").read().strip() or None
-    except OSError:
-        return None
+    cmd = [
+        shutil.which("fzf") or "fzf",
+        "--delimiter=\t",
+        "--with-nth=1",
+        "--header-lines=1",
+        "--no-sort",
+        f"--preview={preview_cmd}",
+        "--preview-window=down:40%:wrap",
+        "--height=90%",
+        "--layout=reverse",
+        "--border",
+        f"--header={header}",
+        "--prompt=Select session > ",
+    ] + [f"--bind={b}" for b in binds]
+    env = os.environ.copy()
+    if _IS_WINDOWS:
+        # With $SHELL set (e.g. launched from Git Bash) fzf would run the .bat
+        # helpers through bash, which mangles their Windows paths: drop it so
+        # fzf falls back to cmd.exe.
+        env.pop("SHELL", None)
+    with open(input_file, "rb") as stdin:
+        proc = subprocess.run(cmd, stdin=stdin, stdout=subprocess.PIPE, env=env)
+    return proc.stdout.decode("utf-8", errors="replace").strip() or None
 
 
 # ── result table ───────────────────────────────────────────────────────────────
