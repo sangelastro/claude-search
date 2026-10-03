@@ -13,9 +13,52 @@ indexer (`__main__.py`) and the fzf preview subprocess.
 
 import json
 import re
+import unicodedata
 
 # Strip terminal colour codes that leak into command output (e.g. stdout).
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# Control characters (incl. \r and \t) and any escape-sequence leftovers.
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+
+def one_line(text: str) -> str:
+    """Collapse ``text`` to a single, terminal-safe line.
+
+    Pasted Windows text carries ``\\r\\n``: replacing only ``\\n`` left the
+    ``\\r``, which sends the cursor back to column 0 and makes the rest of the
+    line overwrite what was already drawn (garbled rows in fzf).
+    """
+    text = _CTRL_RE.sub(" ", _ANSI_RE.sub("", text or ""))
+    return " ".join(text.split())
+
+
+def display_width(text: str) -> int:
+    """Terminal cell width: wide chars (emoji, CJK) take 2, combining marks 0."""
+    return sum(_char_width(ch) for ch in text)
+
+
+def _char_width(ch: str) -> int:
+    if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def fit(text: str, width: int, keep_end: bool = False) -> str:
+    """Truncate (with "…") and pad ``text`` to exactly ``width`` terminal cells.
+
+    ``keep_end`` keeps the tail instead of the head (useful for paths).
+    """
+    if display_width(text) > width:
+        chars = list(reversed(text)) if keep_end else list(text)
+        out, used = [], 1  # 1 cell reserved for "…"
+        for ch in chars:
+            w = _char_width(ch)
+            if used + w > width:
+                break
+            out.append(ch)
+            used += w
+        text = "…" + "".join(reversed(out)) if keep_end else "".join(out) + "…"
+    return text + " " * (width - display_width(text))
 
 # Messages that are purely Claude Code machinery — no user-authored value.
 _NOISE_PREFIXES = (
@@ -107,7 +150,7 @@ def preview_text(filepath, n: int = 10) -> str:
     """Build the multi-line preview shown in fzf / the numbered-list fallback."""
     lines = []
     for i, text in enumerate(iter_user_texts(filepath), 1):
-        lines.append(f"[{i}] " + text[:400].replace("\n", " "))
+        lines.append(f"[{i}] " + one_line(text)[:400])
         if i >= n:
             break
     return "\n".join(lines) if lines else "(no messages)"
